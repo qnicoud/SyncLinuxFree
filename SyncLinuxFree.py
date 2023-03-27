@@ -1,11 +1,11 @@
+import os
+
+os.system("python3 -m pip install pandas tabulate")
+
+import pwd, re, hashlib, asyncio, subprocess
 from math import ceil
-import os, pwd, re, hashlib
-from shutil import which
-from struct import calcsize
-from click import command
 import pandas as p
 from subprocess import Popen, PIPE
-import asyncio
 
 
 class Display():
@@ -51,10 +51,12 @@ class Display():
         self.print_title(self.term_size.columns)
         self.display_selector()
 
-        nb_printed_lines = self.last_displayed_data - self.first_displayed_data - 1
+        if (self.display_type == "syncer" and self.syncer.syncer_output_type == "text") or self.display_type == "help":
+            nb_printed_lines = self.text_last_displayed_data - self.text_first_displayed_data - 2
+        else:
+            nb_printed_lines = self.last_displayed_data - self.first_displayed_data - 1
         if nb_printed_lines < self.max_displayed_rows:
-            print("\n" * (self.max_displayed_rows - nb_printed_lines - 2))
-        
+            print("\n" * (self.max_displayed_rows - nb_printed_lines))
         
         override_validation = True if self.display_name == "syncer overview" else False
 
@@ -62,7 +64,6 @@ class Display():
             print("_" * self.term_size.columns)
             print(f"INFOS: {self.history}")
             print("_" * self.term_size.columns)
-        
             self.command = self.prompt.render_prompt(override_validation)
 
     def print_title(self, term_width):
@@ -111,6 +112,7 @@ class Display():
 
     def text_page_selector(self, text):
         lines_range = range(len(text) + 1)
+        
         split_text = [lines_range[i:i+self.max_displayed_rows] for i in range(0, len(lines_range), self.max_displayed_rows)]
 
         if not self.text_next_displayed_data in lines_range:
@@ -164,8 +166,8 @@ class Display():
             self.text_first_displayed_data, self.text_last_displayed_data = self.print_text()
         elif self.display_type == "syncer":
             if self.syncer.syncer_output_type == "text":
-                self.text_last_displayed_data = len(self.syncer.syncer_output_data)
-                self.print_text()
+                self.text_next_displayed_data = len(self.syncer.syncer_output_data)
+                self.text_first_displayed_data, self.text_last_displayed_data = self.print_text()
             else:
                 self.syncer_handler()
 
@@ -247,8 +249,12 @@ class Display():
             self.display_type = "data"
 
         elif self.command == "sauvegarder":
-            if self.display_name == "syncer overview":
-                asyncio.run(self.syncer.sync())
+            if self.display_name == "syncer overview" and not self.syncer.ongoing and not self.syncer.synced:
+                self.syncer.syncer_output_type = "text"
+                self.syncer.syncer_output_data = ["Début de la sauvegarde !", "++++++++++++++++++++++++", ""]
+                self.syncer.will_start = True
+                self.syncer.ongoing = True
+                self.history = "Sauvegarde en cours..."
             else:
                 self.history = "Impossible de lancer la sauvegarde d'ici."
 
@@ -280,6 +286,7 @@ class Display():
 
             if self.display_name == "syncer subdata":
                 self.syncer.syncer_output_data[self.new_data_info] = self.data.df.copy()
+                self.syncer.final_data = self.syncer.syncer_output_data.copy()
                 self.syncer.update_stats()
                 self.data.change_data("syncer overview", self.syncer.syncer_output_data["dir_status"])
                 self.history = f"Changements validés, veuillez choisir un autre dossier ou 'sauvegarder' pour lancer la sauvegarde miroir."
@@ -508,10 +515,13 @@ class Syncer():
         self.syncer_output_type = "text"
         self.syncer_output_data = ["Nous sommes en train de déterminer quelles données nous devons synchroniser.",
             "Veuillez patienter..."]
+        self.final_data = None
 
         self.data_gathered = False
 
+        self.will_start = False
         self.ongoing = False if source_dirs is None else True 
+        self.synced = False
     
     def gather_data(self):
 
@@ -528,6 +538,7 @@ class Syncer():
         
         self.syncer_output_type = "data"
         self.syncer_output_data["dir_status"] = dir_list_df
+        self.final_data = self.syncer_output_data.copy()
 
         self.data_gathered = True
         self.ongoing = False
@@ -667,12 +678,86 @@ class Syncer():
         self.syncer_output_type = "text"
         self.ongoing = True
 
-        self.syncer_output_data = ["lol"]
+        TOT_ACTIONS = 0
+        for i in self.final_data:
+            if i == "dir_status":
+                continue
+            TOT_ACTIONS += self.final_data[i][self.final_data[i]["Statut"] != "IDENTIQUE"][self.final_data[i]["Sera synchronisé"]].shape[0]
+        
+        all_subprocesses = []
 
-        await asyncio.sleep(30)
+        ACTUAL_ACTION = 0
+        for i in self.final_data:
+            if i == "dir_status":
+                continue
+            curr_data = self.final_data[i]
 
-        self.syncer_output_data = ["LOL"]
+            def set_new_folder(path, folder):
+                split_list = path.split('/')
+                index_i = split_list.index(folder)
+                return "./" + "/".join(split_list[index_i:])
+
+            for row in range(1, curr_data.shape[0] + 1):
+                curr_row = curr_data.loc[row, :].values.flatten().tolist()
+                if not curr_row[3]:
+                    continue
+
+                match curr_row[0]:
+                    case "AJOUTE":
+                        new_folder = set_new_folder(os.path.dirname(curr_row[1]), i)
+                        displayed_string = f"{curr_row[0]} le fichier {curr_row[1]}."
+                        
+                        all_subprocesses.append(Popen(f"mkdir -p {self.target_dir}/{new_folder} && cp {curr_row[1]} {self.target_dir}/{new_folder}/", shell=True))
+
+                    case "MODIFIE":
+                        displayed_string = f"{curr_row[0]} le fichier {curr_row[2]}."
+
+                        all_subprocesses.append(Popen(f"cp {curr_row[1]} {curr_row[2]}", shell=True))
+
+                    case "DEPLACE":
+                        new_folder = set_new_folder(os.path.dirname(curr_row[1]), i)
+                        displayed_string = f"{curr_row[0]} le fichier {curr_row[2]} vers {new_folder}."
+
+                        all_subprocesses.append(Popen(f"mkdir -p {self.target_dir}/{new_folder} && mv {curr_row[2]} {self.target_dir}/{new_folder}/", shell=True))
+
+                    case "SUPPRIME":
+                        displayed_string = f"{curr_row[0]} le fichier {curr_row[2]}."
+                        
+                        all_subprocesses.append(Popen(f"rm {curr_row[2]}", shell=True))
+
+                    case "IDENTIQUE":
+                        continue
+
+                ACTUAL_ACTION += 1
+                PERCENTAGE = ACTUAL_ACTION * 100 // TOT_ACTIONS
+                SPACES = " " * (4 - len(str(PERCENTAGE)))
+
+                self.syncer_output_data.append(f" - {PERCENTAGE}%{SPACES}({ACTUAL_ACTION}/{TOT_ACTIONS}) : {displayed_string}") 
+                await asyncio.sleep(0.5)
+        
+        self.check_still_running(all_subprocesses)
+
+        self.syncer_output_data.append("Purge des dossiers vides")
+        await asyncio.sleep(0.2)
+
+        all_subprocesses = []
+        walk_list = [[root, dirs, files] for root, dirs, files in os.walk(self.target_dir, topdown=True)]
+        while walk_list != []:
+            curr_list = walk_list.pop(-1)
+            if curr_list[1] == [] and curr_list[2] == []:
+                all_subprocesses.append(Popen(f"rmdir {curr_list[0]}", shell=True))
+
+        self.check_still_running(all_subprocesses)
+
+        self.syncer_output_data.append("Dossiers vides purgés.")
+        await asyncio.sleep(0.1)
+
+        self.syncer_output_data.extend(["", 
+                                        "Fin de la sauvegarde ! \o/",
+                                        "++++++++++++++++++++++++++"])
+        
         self.ongoing = False
+        self.synced = True
 
     def hash_file(self, filename):
         """"This function returns the SHA-1 hash
@@ -694,26 +779,50 @@ class Syncer():
         # return the hex representation of digest
         return h.hexdigest()      
 
+    def check_still_running(self, all_subprocesses): 
+        still_running = True
+        while still_running :
+            still_running = False
+            for elem in all_subprocesses:
+                if elem.poll() == None:
+                    still_running = True
+                    break
 
-os.system('rm -rf /media/e/backup/A_test/*')
-os.system('cp ~/B_test/* /media/e/backup/A_test/')
-screen = Display()
-is_cmd_ok = False
-while screen.executes:
-    screen.display()
 
-    if screen.syncer.ongoing:
-        if not screen.syncer.data_gathered:
-            screen.syncer.gather_data()
-            screen.syncer.ongoing = False
-            screen.syncer.syncer_output_type = "data"
+async def main():
+    os.system('rm -rf /media/e/backup/A_test/* /media/e/backup/B_test')
+    os.system('cp ~/B_test/* /media/e/backup/A_test/')
+    screen = Display()
+    is_cmd_ok = False
+    while screen.executes:
+        screen.display()
 
-    else:
-        is_cmd_ok = screen.base_commands_handler()
-        if not is_cmd_ok:
-            screen.specific_commands_handler()
-    
-    #input("temporisation")
+        if screen.syncer.will_start:
+            screen.syncer.will_start = False
+            sync_task = asyncio.create_task(screen.syncer.sync())
+            screen.command = ""
+            screen.history = "Fin de la sauvegarde. Vous pouvez inspecter les changements ou quitter."
 
-os.system('clear')
-print("Fin d'exécution du programme de sauvegarde de fichiers.")
+        sync_task_exists = 'sync_task' in locals() or 'sync_task' in globals()
+        if screen.syncer.ongoing and not screen.syncer.synced and sync_task_exists:
+            if not sync_task.done():
+                await asyncio.sleep(0.1)
+
+        if screen.syncer.ongoing:
+            if not screen.syncer.data_gathered:
+                screen.syncer.gather_data()
+                screen.syncer.ongoing = False
+                screen.syncer.syncer_output_type = "data"
+        else:
+            is_cmd_ok = screen.base_commands_handler()
+            if not is_cmd_ok:
+                screen.specific_commands_handler()
+        
+        # input("temporisation")
+
+    os.system('clear')
+    print("Fin d'exécution du programme de sauvegarde de fichiers.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
